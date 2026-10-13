@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import datetime
 import os
+import socket
 import tempfile
 from collections import defaultdict
 import cv2
@@ -9,6 +10,19 @@ import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 from ultralytics.solutions.heatmap import Heatmap
+
+
+def resolve_gradio_port(preferred_port=7860, max_port=7869):
+    """Find the first free local port in a small range so the app can launch even when 7860 is busy."""
+    for port in range(preferred_port, max_port + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise OSError(f"No free Gradio port found in range {preferred_port}-{max_port}")
 
 # -------------------------------------------------------------
 # Helpers & Inference Pipeline
@@ -67,9 +81,155 @@ def draw_dots_on_frame(frame, results, min_conf=0.3, min_box_area=0, track_histo
 
 
 def resolve_model_path(model_id):
-    if not os.path.exists(model_id) and model_id in ["medium.pt", "best.pt"]:
+    """Prefer a person-detection-friendly model while accepting YOLO26n aliases.
+
+    The project does not ship a real custom checkpoint, and the installed Ultralytics runtime
+    does not provide the exact yolo26n weights, so the code gracefully falls back to the latest
+    supported Nano model in this environment instead of crashing on a missing file.
+    """
+    if model_id in {"", None}:
+        model_id = "yolo26n.pt"
+
+    normalized = str(model_id).strip().strip('"').strip("'")
+    if normalized in {"yolo26n", "yolo26n.pt"}:
+        if os.path.exists("yolo26n.pt"):
+            return "yolo26n.pt"
+        return "yolo11n.pt"
+    if normalized in {"yolov8n", "yolov8n.pt"}:
         return "yolov8n.pt"
-    return model_id
+    if normalized in {"yolov8s", "yolov8s.pt"}:
+        return "yolov8s.pt"
+    if normalized in {"yolov8m", "yolov8m.pt"}:
+        return "yolov8m.pt"
+    if normalized in {"yolov12n", "yolov12n.pt"}:
+        return "yolov12n.pt"
+    if normalized in {"yolov12s", "yolov12s.pt"}:
+        return "yolov12s.pt"
+    if normalized in {"yolov12m", "yolov12m.pt"}:
+        return "yolov12m.pt"
+    if normalized in {"yolo11n", "yolo11n.pt"}:
+        return "yolo11n.pt"
+    if normalized in {"medium.pt", "best.pt"}:
+        return "yolo11n.pt"
+    if not os.path.exists(normalized) and normalized not in {"yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov12n.pt", "yolov12s.pt", "yolov12m.pt", "yolo11n.pt", "yolo26n.pt"}:
+        return "yolo11n.pt"
+    return normalized
+
+
+def build_human_warning(count):
+    if count >= 8:
+        return "CRITICAL: crowd surge detected", "danger"
+    if count >= 5:
+        return "WARNING: dense human flow detected", "warning"
+    if count >= 2:
+        return "CAUTION: elevated human activity", "warning"
+    return "NORMAL: safe human density", "ok"
+
+
+def _predict_person_boxes(frame_bgr, model_id, conf_threshold=0.08, max_det=500):
+    """Run one YOLO pass for person class and return normalized person boxes/centroids."""
+    model = _get_cached_model(resolve_model_path(model_id))
+    results = model.predict(
+        source=frame_bgr,
+        imgsz=768,
+        conf=conf_threshold,
+        classes=[0],
+        max_det=max_det,
+        iou=0.45,
+        verbose=False,
+        augment=True,
+    )
+
+    centroids = []
+    boxes_out = []
+    if results and len(results) > 0 and results[0].boxes is not None:
+        h, w = frame_bgr.shape[:2]
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = map(float, box.xyxy[0])
+            conf = float(box.conf[0])
+            if conf < conf_threshold:
+                continue
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            cx_hm = cx / w * 480
+            cy_hm = cy / h * 190
+            radius = max(18, min(60, (y2 - y1) / h * 190 * 0.7))
+            centroids.append({"x": round(cx_hm, 1), "y": round(cy_hm, 1), "radius": round(radius, 1)})
+            boxes_out.append({
+                "x1": round(x1 / w, 4), "y1": round(y1 / h, 4),
+                "x2": round(x2 / w, 4), "y2": round(y2 / h, 4),
+                "conf": round(conf, 2)
+            })
+
+    return centroids, boxes_out
+
+
+# -------------------------------------------------------------
+# YOLO Real-Time Frame Inference Endpoint
+# Called by JS every ~1.5s with a base64 JPEG captured from webcam
+# Returns JSON: {count, centroids: [{x,y,radius}], boxes: [{x1,y1,x2,y2,conf}]}
+# -------------------------------------------------------------
+import base64
+import json
+import threading
+
+# Cache the loaded model so we don't reload on every frame
+_model_cache: dict = {}
+_model_cache_lock = threading.Lock()
+
+def _get_cached_model(model_id: str):
+    """Load and cache YOLO model by model_id to avoid reloading every frame."""
+    with _model_cache_lock:
+        if model_id not in _model_cache:
+            actual = resolve_model_path(model_id)
+            try:
+                _model_cache[model_id] = YOLO(actual)
+                print(f"[DensiTrack] Loaded model: {actual}")
+            except Exception as e:
+                print(f"[DensiTrack] Failed to load {actual}: {e}. Falling back to yolo11n.pt")
+                _model_cache[model_id] = YOLO("yolo11n.pt")
+        return _model_cache[model_id]
+
+
+def predict_frame_base64(frame_b64: str, model_id: str) -> str:
+    """Analyze one image for people using a model fallback chain so uploaded photos do not collapse to zero detections."""
+    try:
+        img_bytes = base64.b64decode(frame_b64)
+        np_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            return json.dumps({"count": 0, "centroids": [], "boxes": [], "warning": "NORMAL: safe human density", "warning_level": "ok"})
+
+        candidates = []
+        seen = set()
+        for candidate in [model_id, "yolo26n.pt", "yolo11n.pt", "yolov8n.pt", "yolov12n.pt", "yolov8s.pt"]:
+            normalized = str(candidate).strip().strip('"').strip("'")
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(normalized)
+
+        best_centroids = []
+        best_boxes = []
+        for candidate in candidates:
+            centroids, boxes_out = _predict_person_boxes(frame_bgr, candidate, conf_threshold=0.08, max_det=500)
+            if len(centroids) > len(best_centroids):
+                best_centroids = centroids
+                best_boxes = boxes_out
+            if len(best_centroids) >= 1:
+                break
+
+        warning, warning_level = build_human_warning(len(best_centroids))
+        return json.dumps({
+            "count": len(best_centroids),
+            "centroids": best_centroids,
+            "boxes": best_boxes,
+            "warning": warning,
+            "warning_level": warning_level,
+        })
+
+    except Exception as exc:
+        print(f"[DensiTrack] predict_frame_base64 error: {exc}")
+        return json.dumps({"count": 0, "centroids": [], "boxes": [], "warning": "NORMAL: safe human density", "warning_level": "ok"})
 
 
 def yolov12_tracker_inference(image, video, model_id, image_size, conf_threshold, mode, viz_mode, use_tracking):
@@ -226,7 +386,7 @@ INITIAL_CAMERAS = [
         "status": "LIVE",
         "assigned_name": "Vikram Rathore",
         "assigned_role": "Crowd Control Lead",
-        "density": "High (84%)",
+        "density": "Awaiting Analysis",
     },
     {
         "id": "CAM-02",
@@ -236,7 +396,7 @@ INITIAL_CAMERAS = [
         "status": "LIVE",
         "assigned_name": "Sarah Connor",
         "assigned_role": "Perimeter Security Officer",
-        "density": "Medium (52%)",
+        "density": "Awaiting Analysis",
     },
     {
         "id": "CAM-03",
@@ -246,7 +406,7 @@ INITIAL_CAMERAS = [
         "status": "LIVE",
         "assigned_name": "Dr. Aarav Mehra",
         "assigned_role": "Medical First Responder",
-        "density": "Low (21%)",
+        "density": "Awaiting Analysis",
     },
     {
         "id": "CAM-04",
@@ -256,52 +416,11 @@ INITIAL_CAMERAS = [
         "status": "WARNING",
         "assigned_name": "Rajesh Sharma",
         "assigned_role": "Emergency Dispatch Commander",
-        "density": "Critical (93%)",
+        "density": "Awaiting Analysis",
     },
 ]
 
-INITIAL_ALERTS = [
-    {
-        "id": "ALT-101",
-        "camera_id": "CAM-04",
-        "camera_name": "CAM 04 - Sector B Queue Corridor",
-        "severity": "Critical",
-        "message": "Density bottleneck detected! Surge rate exceeds 3.4 persons/sq.m limit.",
-        "assigned_person": "Rajesh Sharma (Emergency Dispatch)",
-        "timestamp": "19:18:22",
-        "status": "Active",
-    },
-    {
-        "id": "ALT-102",
-        "camera_id": "CAM-01",
-        "camera_name": "CAM 01 - Main Entrance Plaza",
-        "severity": "Warning",
-        "message": "High pedestrian inflow rate detected at entry turnstiles.",
-        "assigned_person": "Vikram Rathore (Crowd Control Lead)",
-        "timestamp": "19:14:05",
-        "status": "Acknowledged",
-    },
-    {
-        "id": "ALT-103",
-        "camera_id": "CAM-02",
-        "camera_name": "CAM 02 - North Gate Concourse",
-        "severity": "Info",
-        "message": "Steady queue distribution maintained across 4 lanes.",
-        "assigned_person": "Sarah Connor (Perimeter Security)",
-        "timestamp": "19:02:11",
-        "status": "Resolved",
-    },
-    {
-        "id": "ALT-104",
-        "camera_id": "CAM-03",
-        "camera_name": "CAM 03 - West Promenade & Stairs",
-        "severity": "Info",
-        "message": "Normal pedestrian throughput observed.",
-        "assigned_person": "Dr. Aarav Mehra (Medical Team)",
-        "timestamp": "18:55:40",
-        "status": "Resolved",
-    },
-]
+INITIAL_ALERTS = []
 
 # -------------------------------------------------------------
 # HTML Rendering Utilities for Visuvate Dark Aesthetic
@@ -342,10 +461,10 @@ def render_camera_detail_full_html(cam=None, alerts=None):
     officer_role = cam.get("assigned_role", "Crowd Control Lead")
     location = cam.get("location", "North Gate Section A")
     initial = officer_name[0] if officer_name else "V"
-    density_str = cam.get("density", "High (84%)")
-    density_pct = 85 if ("84%" in density_str or "93%" in density_str) else (52 if "52%" in density_str else 22)
-    density_color = '#ef4444' if density_pct >= 70 else ('#f59e0b' if density_pct >= 50 else '#22c55e')
-    chokepoint_label = 'Critical Surge' if density_pct >= 70 else ('Elevated Flow' if density_pct >= 50 else 'Optimal Flow')
+    density_str = cam.get("density", "Awaiting Analysis")
+    density_pct = 0
+    density_color = '#a1a1aa'
+    chokepoint_label = 'Standby'
 
     cam_alerts = [a for a in alerts if a.get("camera_id") == cam_id or a.get("camera_name") == cam.get("name")]
     alert_rows = []
@@ -409,35 +528,44 @@ def render_camera_detail_full_html(cam=None, alerts=None):
                     AI Model:
                 </span>
                 <select id="detail-model-select" onchange="onModelChanged(this.value)" style="background: #0e0e12; color: #ffffff; border: 1px solid #33333f; border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; outline: none; cursor: pointer;">
-                    <option value="best.pt" selected>Custom Trained (best.pt)</option>
-                    <option value="medium.pt">Fine-Tuned Crowd (medium.pt)</option>
+                    <option value="yolo26n.pt" selected>YOLO26 Nano (yolo26n.pt)</option>
+                    <option value="yolov8n.pt">Human Detection (yolov8n.pt)</option>
+                    <option value="yolov8s.pt">YOLOv8 Small (yolov8s.pt)</option>
                     <option value="yolov12n.pt">YOLOv12 Nano (yolov12n.pt)</option>
                     <option value="yolov12m.pt">YOLOv12 Medium (yolov12m.pt)</option>
-                    <option value="yolov8n.pt">YOLOv8 Nano (yolov8n.pt)</option>
                     <option value="yolo11n.pt">YOLO11 Nano (yolo11n.pt)</option>
+                    <option value="best.pt">Custom Placeholder (best.pt)</option>
                 </select>
                 <span id="model-active-indicator" style="width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e;"></span>
             </div>
+        </div>
+
+        <div id="media-upload-bar" style="display: { 'flex' if cam_id in ['CAM-02', 'CAM-03'] else 'none' }; align-items: center; gap: 8px; margin-top: 10px; width: 100%; justify-content: flex-end;">
+            <input id="media-upload-input" type="file" accept="video/*" style="display: none;" />
+            <button id="media-upload-btn" onclick="triggerMediaUpload()" style="background: linear-gradient(135deg, #0072f5, #2563eb); color: #ffffff; border: none; border-radius: 8px; padding: 8px 12px; font-size: 11px; font-weight: 700; cursor: pointer;">{'Upload Video' if cam_id == 'CAM-02' else 'Upload Image' if cam_id == 'CAM-03' else 'Upload Video'}</button>
+            <button id="media-analyze-btn" onclick="analyzeUploadedMediaCycle()" style="display: inline-flex; background: linear-gradient(135deg, #16a34a, #15803d); color: #ffffff; border: none; border-radius: 8px; padding: 8px 12px; font-size: 11px; font-weight: 700; cursor: pointer;">Analyze Now</button>
         </div>
     </div>
 
     <!-- Center Camera Feed: CAM-01 Live Webcam Box (Uncropped - object-fit: contain) -->
     <div id="cam-detail-webcam-box" style="position: relative; width: 100%; min-height: 380px; max-height: 480px; background: #000000; border-radius: 14px; overflow: hidden; border: 1px solid #23232b; box-shadow: 0 10px 30px rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; margin-bottom: 12px;">
         <video id="cam-detail-video" autoplay playsinline muted style="width: 100%; height: 100%; max-height: 480px; object-fit: contain; display: none; background: #000;"></video>
-        <div id="cam-detail-placeholder" style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; cursor: pointer; padding: 24px; text-align: center; width: 100%; min-height: 380px;" onclick="initCamDetailWebcam()">
+        <!-- YOLO Detection Bounding Box Overlay Canvas -->
+        <canvas id="cam-detection-overlay" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5;"></canvas>
+        <div id="cam-detail-placeholder" style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 24px; text-align: center; width: 100%; min-height: 380px;">
             <div style="width: 52px; height: 52px; border-radius: 50%; background: rgba(0, 114, 245, 0.2); border: 1px solid rgba(0, 114, 245, 0.5); display: flex; align-items: center; justify-content: center; color: #0072f5; box-shadow: 0 0 24px rgba(0, 114, 245, 0.3);">
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
             </div>
             <div style="color: #ffffff; font-size: 15px; font-weight: 600;">Hardware Webcam Feed Active</div>
-            <div style="color: #71717a; font-size: 12px; max-width: 320px;">Streaming live webcam into CAM 01. Click if camera permission prompt is required.</div>
+            <div style="color: #71717a; font-size: 12px; max-width: 320px;">Camera access is being enabled. Human detection will begin automatically once the live stream starts.</div>
         </div>
         <!-- CCTV HUD Overlay -->
-        <div style="position: absolute; top: 12px; left: 16px; display: flex; align-items: center; gap: 8px; pointer-events: none;">
+        <div style="position: absolute; top: 12px; left: 16px; display: flex; align-items: center; gap: 8px; pointer-events: none; z-index: 10;">
             <span style="font-size: 10px; font-family: monospace; font-weight: 700; color: #ef4444; background: rgba(0,0,0,0.7); border: 1px solid rgba(239,68,68,0.4); padding: 3px 8px; border-radius: 4px;">● REC [LIVE]</span>
             <span style="font-size: 10px; font-family: monospace; color: #ffffff; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; border: 1px solid #27272a;">PRIMARY WEBCAM</span>
-            <span id="cam-model-badge" style="font-size: 10px; font-family: monospace; color: #60a5fa; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; border: 1px solid #1e3a8a;">MODEL: best.pt</span>
+            <span id="cam-model-badge" style="font-size: 10px; font-family: monospace; color: #60a5fa; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; border: 1px solid #1e3a8a;">MODEL: yolo26n.pt</span>
         </div>
-        <div style="position: absolute; bottom: 12px; left: 16px; right: 16px; display: flex; justify-content: space-between; align-items: center; pointer-events: none;">
+        <div style="position: absolute; bottom: 12px; left: 16px; right: 16px; display: flex; justify-content: space-between; align-items: center; pointer-events: none; z-index: 10;">
             <span id="cam-detail-person-metric" style="font-size: 10px; font-family: monospace; color: #22c55e; background: rgba(0,0,0,0.75); padding: 3px 8px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3);">● 1080p HD • ANALYZED PERSONS: 0</span>
             <span id="cam-detail-timestamp-webcam" style="font-size: 10px; font-family: monospace; color: #ffffff; background: rgba(0,0,0,0.75); padding: 3px 8px; border-radius: 4px; border: 1px solid #27272a;"></span>
         </div>
@@ -449,10 +577,10 @@ def render_camera_detail_full_html(cam=None, alerts=None):
         <div style="position: absolute; top: 12px; left: 16px; display: flex; align-items: center; gap: 8px; pointer-events: none;">
             <span style="font-size: 10px; font-family: monospace; font-weight: 700; color: #22c55e; background: rgba(0,0,0,0.7); border: 1px solid rgba(34, 197, 94, 0.4); padding: 3px 8px; border-radius: 4px;">● RTSP STREAM</span>
             <span style="font-size: 10px; font-family: monospace; color: #ffffff; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; border: 1px solid #27272a;">OPTICAL SURVEILLANCE</span>
-            <span id="optical-model-badge" style="font-size: 10px; font-family: monospace; color: #60a5fa; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; border: 1px solid #1e3a8a;">MODEL: best.pt</span>
+            <span id="optical-model-badge" style="font-size: 10px; font-family: monospace; color: #60a5fa; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; border: 1px solid #1e3a8a;">MODEL: yolo26n.pt</span>
         </div>
         <div style="position: absolute; bottom: 12px; left: 16px; right: 16px; display: flex; justify-content: space-between; align-items: center; pointer-events: none;">
-            <span id="cam-optical-person-metric" style="font-size: 10px; font-family: monospace; color: #22c55e; background: rgba(0,0,0,0.75); padding: 3px 8px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3);">● AI TRACKING ENABLED • ANALYZED PERSONS: 4</span>
+            <span id="cam-optical-person-metric" style="font-size: 10px; font-family: monospace; color: #22c55e; background: rgba(0,0,0,0.75); padding: 3px 8px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3);">● WAITING FOR LIVE ANALYSIS • ANALYZED PERSONS: 0</span>
             <span id="cam-detail-timestamp-optical" style="font-size: 10px; font-family: monospace; color: #ffffff; background: rgba(0,0,0,0.75); padding: 3px 8px; border-radius: 4px; border: 1px solid #27272a;"></span>
         </div>
     </div>
@@ -486,15 +614,15 @@ def render_camera_detail_full_html(cam=None, alerts=None):
             <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px;">
                 <div style="background: #16161c; border: 1px solid #24242e; border-radius: 8px; padding: 8px 10px;">
                     <div style="font-size: 10px; color: #71717a; text-transform: uppercase;">Crowd Density</div>
-                    <div id="detail-density-val" style="font-size: 13px; font-weight: 700; color: #ffffff; margin-top: 2px;">{density_str}</div>
+                    <div id="detail-density-val" style="font-size: 13px; font-weight: 700; color: #ffffff; margin-top: 2px;">Awaiting Analysis</div>
                 </div>
                 <div style="background: #16161c; border: 1px solid #24242e; border-radius: 8px; padding: 8px 10px;">
                     <div style="font-size: 10px; color: #71717a; text-transform: uppercase;">Chokepoint Level</div>
-                    <div id="detail-chokepoint-val" style="font-size: 13px; font-weight: 700; color: {density_color}; margin-top: 2px;">{chokepoint_label}</div>
+                    <div id="detail-chokepoint-val" style="font-size: 13px; font-weight: 700; color: #a1a1aa; margin-top: 2px;">Standby</div>
                 </div>
                 <div style="background: #16161c; border: 1px solid #24242e; border-radius: 8px; padding: 8px 10px;">
                     <div style="font-size: 10px; color: #71717a; text-transform: uppercase;">Active Model</div>
-                    <div id="detail-model-tag" style="font-size: 13px; font-weight: 700; color: #ffffff; margin-top: 2px;">best.pt</div>
+                    <div id="detail-model-tag" style="font-size: 13px; font-weight: 700; color: #ffffff; margin-top: 2px;">yolo26n.pt</div>
                 </div>
             </div>
         </div>
@@ -1134,7 +1262,7 @@ a[href*="huggingface.co"],
 HEAD_JS = """
 <script>
 window.cctvGlobalStream = null;
-window.selectedModelId = 'best.pt';
+window.selectedModelId = 'yolo26n.pt';
 window.currentActiveCamId = 'CAM-01';
 window.analyzedPersonCentroids = [];
 window.isAnalyzingFeed = false;
@@ -1162,48 +1290,40 @@ window.cctvCameraRegistry = {
         name: 'CAM 01 - Main Entrance Plaza',
         location: 'North Gate Section A',
         type: 'System Hardware Webcam',
-        density: 'High (84%)',
-        densityLevel: 'Critical Surge',
-        densityColor: '#ef4444',
-        alerts: [
-            { time: '19:14:05', sev: 'Warning', msg: 'High pedestrian inflow rate detected at entry turnstiles.' }
-        ]
+        density: 'Awaiting Analysis',
+        densityLevel: 'Standby',
+        densityColor: '#a1a1aa',
+        alerts: []
     },
     'CAM-02': {
         id: 'CAM-02',
         name: 'CAM 02 - North Gate Concourse',
         location: 'Sector 3 Checkpoint',
         type: 'IP / RTSP Stream',
-        density: 'Medium (52%)',
-        densityLevel: 'Elevated Flow',
-        densityColor: '#f59e0b',
-        alerts: [
-            { time: '19:02:11', sev: 'Info', msg: 'Steady queue distribution maintained across 4 lanes.' }
-        ]
+        density: 'Awaiting Analysis',
+        densityLevel: 'Standby',
+        densityColor: '#a1a1aa',
+        alerts: []
     },
     'CAM-03': {
         id: 'CAM-03',
         name: 'CAM 03 - West Promenade & Stairs',
         location: 'West Plaza Walkway',
         type: 'PTZ Dome Optical',
-        density: 'Low (21%)',
-        densityLevel: 'Optimal Flow',
-        densityColor: '#22c55e',
-        alerts: [
-            { time: '18:55:40', sev: 'Info', msg: 'Normal pedestrian throughput observed.' }
-        ]
+        density: 'Awaiting Analysis',
+        densityLevel: 'Standby',
+        densityColor: '#a1a1aa',
+        alerts: []
     },
     'CAM-04': {
         id: 'CAM-04',
         name: 'CAM 04 - Sector B Queue Corridor',
         location: 'Central Pavilion Lane 4',
         type: 'Infrared Thermal / Optical',
-        density: 'Critical (93%)',
-        densityLevel: 'Critical Surge',
-        densityColor: '#ef4444',
-        alerts: [
-            { time: '19:18:22', sev: 'Critical', msg: 'Density bottleneck detected! Surge rate exceeds 3.4 persons/sq.m limit.' }
-        ]
+        density: 'Awaiting Analysis',
+        densityLevel: 'Standby',
+        densityColor: '#a1a1aa',
+        alerts: []
     }
 };
 
@@ -1385,119 +1505,201 @@ function initCamDetailWebcam() {
             video.srcObject = stream;
             video.play().catch(e => console.log(e));
             video.style.display = 'block';
-            if (placeholder) placeholder.style.display = 'none';
-            startLivePersonAnalysisLoop();
+            if (placeholder) {
+                placeholder.style.display = 'none';
+            }
+            if (!window.analysisRunning) {
+                startLivePersonAnalysisLoop();
+            }
         }
     }, function(err) {
-        if (placeholder) placeholder.style.display = 'flex';
+        if (placeholder) {
+            placeholder.style.display = 'flex';
+            placeholder.innerHTML = '<div style="color: #f59e0b; font-size: 12px; text-align: center;">Camera access was not granted yet. Please allow the webcam and the system will start live analysis automatically.</div>';
+        }
     });
 }
 
 // -------------------------------------------------------------
-// Live Feed Person Analysis & Centroid Extraction
+// Real YOLO-Based Live Feed Analysis via Python Backend
 // -------------------------------------------------------------
 let analysisInterval = null;
+window.yoloDetectionBoxes = []; // Current detection boxes for overlay canvas
+window.analysisRunning = false;
+
+function startLiveAnalysisButtonAction() {
+    if (window.analysisRunning) return;
+    initCamDetailWebcam();
+    if (!window.analysisRunning) {
+        startLivePersonAnalysisLoop();
+    }
+}
 
 function startLivePersonAnalysisLoop() {
     if (analysisInterval) clearInterval(analysisInterval);
-    analysisInterval = setInterval(analyzeActiveFeed, 1800);
-    analyzeActiveFeed();
+    analysisInterval = setInterval(analyzeActiveFeedYOLO, 1500);
+    analyzeActiveFeedYOLO();
+    window.analysisRunning = true;
 }
 
-function analyzeActiveFeed() {
-    const camId = window.currentActiveCamId || 'CAM-01';
-    let personCount = 0;
-    let centroids = [];
-
-    if (camId === 'CAM-01') {
-        const video = document.getElementById('cam-detail-video');
-        if (video && video.readyState >= 2 && video.videoWidth > 0) {
-            // Process real live frame from webcam
-            const w = video.videoWidth;
-            const h = video.videoHeight;
-            
-            // Sample pixel activity & brightness variations across grid sectors
+// Capture one JPEG frame from the webcam video and send to Python YOLO endpoint
+async function captureFrameBase64(videoEl, quality) {
+    return new Promise((resolve) => {
+        try {
             const offscreen = document.createElement('canvas');
-            offscreen.width = 160;
-            offscreen.height = 90;
+            offscreen.width = 640;
+            offscreen.height = 360;
             const ctx = offscreen.getContext('2d');
-            ctx.drawImage(video, 0, 0, 160, 90);
-            
-            try {
-                const imgData = ctx.getImageData(0, 0, 160, 90).data;
-                // Evaluate pixel motion & localized body clusters
-                let clusters = [];
-                const step = 8;
-                for (let y = 10; y < 80; y += step) {
-                    for (let x = 10; x < 150; x += step) {
-                        const idx = (y * 160 + x) * 4;
-                        const r = imgData[idx], g = imgData[idx + 1], b = imgData[idx + 2];
-                        const brightness = (r + g + b) / 3;
-                        // Detect contrast differentials corresponding to human shapes/skin tones/clothing
-                        if (brightness > 45 && brightness < 220) {
-                            clusters.push({ x: (x / 160), y: (y / 90) });
-                        }
-                    }
-                }
-                
-                // Group clusters into representative person centroids
-                const detectedCount = clusters.length > 30 ? Math.min(Math.max(1, Math.floor(clusters.length / 45)), 8) : 1;
-                personCount = detectedCount;
-                
-                for (let i = 0; i < personCount; i++) {
-                    const sample = clusters[Math.floor(i * (clusters.length / personCount))] || { x: 0.3 + (i * 0.2), y: 0.5 };
-                    centroids.push({
-                        x: sample.x * 480,
-                        y: sample.y * 190,
-                        radius: 35 + Math.random() * 20
-                    });
-                }
-            } catch(e) {
-                personCount = 2;
-                centroids = [
-                    { x: 180, y: 95, radius: 45 },
-                    { x: 300, y: 110, radius: 40 }
-                ];
-            }
-        } else {
-            personCount = 1;
-            centroids = [{ x: 240, y: 95, radius: 45 }];
+            ctx.drawImage(videoEl, 0, 0, 640, 360);
+            offscreen.toBlob((blob) => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    // Strip the data URL prefix and return raw base64
+                    const b64 = reader.result.split(',')[1];
+                    resolve(b64);
+                };
+                reader.readAsDataURL(blob);
+            }, 'image/jpeg', quality || 0.75);
+        } catch(e) {
+            resolve(null);
         }
-        
-        const metricEl = document.getElementById('cam-detail-person-metric');
-        if (metricEl) metricEl.innerText = `● 1080p HD • ANALYZED PERSONS: ${personCount} (${window.selectedModelId})`;
-    } else {
-        // Optical camera simulated detection
-        personCount = (camId === 'CAM-04') ? 6 : ((camId === 'CAM-02') ? 3 : 2);
-        centroids = [];
-        for (let i = 0; i < personCount; i++) {
-            centroids.push({
-                x: 60 + (i * (360 / Math.max(1, personCount - 1))) + (Math.sin(Date.now() / 800 + i) * 20),
-                y: 50 + (Math.cos(Date.now() / 900 + i) * 35),
-                radius: 32 + (i % 3) * 8
-            });
-        }
-        const optMetric = document.getElementById('cam-optical-person-metric');
-        if (optMetric) optMetric.innerText = `● AI TRACKING ENABLED • ANALYZED PERSONS: ${personCount} (${window.selectedModelId})`;
+    });
+}
+
+// Call the Gradio predict_frame_base64 function endpoint
+async function callYOLOEndpoint(frameB64, modelId) {
+    try {
+        const payload = { frame_b64: frameB64, model_id: modelId };
+        const resp = await fetch('/yolo_predict', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!resp.ok) return null;
+        return await resp.json();
+    } catch(e) {
+        console.warn('[DensiTrack] YOLO endpoint call failed:', e.message);
+        return null;
+    }
+}
+
+// Draw bounding box overlay on the canvas stacked over the live video
+function drawDetectionOverlay(boxes) {
+    const canvas = document.getElementById('cam-detection-overlay');
+    if (!canvas) return;
+    const video = document.getElementById('cam-detail-video');
+    if (!video || !video.videoWidth) return;
+
+    canvas.width = video.clientWidth || canvas.offsetWidth || 640;
+    canvas.height = video.clientHeight || canvas.offsetHeight || 360;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    boxes.forEach((b, i) => {
+        const x1 = b.x1 * canvas.width;
+        const y1 = b.y1 * canvas.height;
+        const bw = (b.x2 - b.x1) * canvas.width;
+        const bh = (b.y2 - b.y1) * canvas.height;
+
+        // Box
+        ctx.strokeStyle = '#22c55e';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x1, y1, bw, bh);
+
+        // Corner accents
+        const cs = 10;
+        ctx.strokeStyle = '#4ade80';
+        ctx.lineWidth = 3;
+        // TL
+        ctx.beginPath(); ctx.moveTo(x1, y1 + cs); ctx.lineTo(x1, y1); ctx.lineTo(x1 + cs, y1); ctx.stroke();
+        // TR
+        ctx.beginPath(); ctx.moveTo(x1 + bw - cs, y1); ctx.lineTo(x1 + bw, y1); ctx.lineTo(x1 + bw, y1 + cs); ctx.stroke();
+        // BL
+        ctx.beginPath(); ctx.moveTo(x1, y1 + bh - cs); ctx.lineTo(x1, y1 + bh); ctx.lineTo(x1 + cs, y1 + bh); ctx.stroke();
+        // BR
+        ctx.beginPath(); ctx.moveTo(x1 + bw - cs, y1 + bh); ctx.lineTo(x1 + bw, y1 + bh); ctx.lineTo(x1 + bw, y1 + bh - cs); ctx.stroke();
+
+        // Label
+        const label = `Person ${i + 1}  ${Math.round(b.conf * 100)}%`;
+        ctx.font = 'bold 11px monospace';
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+        ctx.fillRect(x1, y1 - 18, tw + 8, 16);
+        ctx.fillStyle = '#4ade80';
+        ctx.fillText(label, x1 + 4, y1 - 5);
+    });
+}
+
+function renderUploadedMediaToCanvas() {
+    const state = window.uploadedMediaState;
+    const canvas = document.getElementById('cctv-optical-stream-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    if (!state) {
+        ctx.fillStyle = 'rgba(96, 165, 250, 0.1)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        return;
     }
 
-    window.analyzedPersonCentroids = centroids;
+    if (state.type === 'image' && state.imgEl) {
+        ctx.drawImage(state.imgEl, 0, 0, canvas.width, canvas.height);
+    } else if (state.type === 'video' && state.videoEl) {
+        ctx.drawImage(state.videoEl, 0, 0, canvas.width, canvas.height);
+    }
+}
 
-    // Update Crowd Density Stats & Badges dynamically
+function drawUploadedDetectionOverlay(boxes) {
+    const canvas = document.getElementById('cctv-optical-stream-canvas');
+    if (!canvas || !boxes || boxes.length === 0) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.save();
+    boxes.forEach((b, i) => {
+        const x1 = Number(b.x1 || 0) * canvas.width;
+        const y1 = Number(b.y1 || 0) * canvas.height;
+        const bw = (Number(b.x2 || 0) - Number(b.x1 || 0)) * canvas.width;
+        const bh = (Number(b.y2 || 0) - Number(b.y1 || 0)) * canvas.height;
+
+        ctx.strokeStyle = '#22c55e';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x1, y1, bw, bh);
+
+        const label = `Person ${i + 1}  ${Math.round((b.conf || 0) * 100)}%`;
+        ctx.font = 'bold 11px monospace';
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+        ctx.fillRect(x1, Math.max(0, y1 - 18), tw + 8, 16);
+        ctx.fillStyle = '#4ade80';
+        ctx.fillText(label, x1 + 4, Math.max(14, y1 - 5));
+    });
+    ctx.restore();
+}
+
+function updateHeatmapAndAlertUI(personCount, sourceLabel) {
     const countBadge = document.getElementById('detail-heatmap-count-badge');
     if (countBadge) countBadge.innerText = `${personCount} Person${personCount === 1 ? '' : 's'} Detected`;
 
     const densVal = document.getElementById('detail-density-val');
     const chokepointVal = document.getElementById('detail-chokepoint-val');
-    
+
     let densityLevelStr = 'Optimal Flow';
-    let densityPctStr = `${Math.min(96, Math.max(12, personCount * 18))}%`;
+    let densityPctStr = `${Math.min(96, Math.max(4, personCount * 16))}%`;
     let color = '#22c55e';
 
-    if (personCount >= 5) {
+    if (personCount >= 6) {
         densityLevelStr = 'Critical Surge';
         color = '#ef4444';
-    } else if (personCount >= 3) {
+    } else if (personCount >= 4) {
+        densityLevelStr = 'High Density';
+        color = '#f97316';
+    } else if (personCount >= 2) {
         densityLevelStr = 'Elevated Flow';
         color = '#f59e0b';
     }
@@ -1508,14 +1710,255 @@ function analyzeActiveFeed() {
         chokepointVal.style.color = color;
     }
 
-    // Trigger Dynamic Incident Alerts if Density Threshold is Breached
-    if (personCount >= 4 && (Date.now() - window.lastAlertTime > 15000)) {
+    const camId = window.currentActiveCamId || 'CAM-02';
+    const alertStatus = personCount >= 6 ? 'Critical' : (personCount >= 3 ? 'Warning' : (personCount > 0 ? 'Info' : 'Normal'));
+    const alertGapMs = personCount > 0 ? 5000 : 20000;
+    if (personCount > 0 && (Date.now() - window.lastAlertTime > alertGapMs)) {
         window.lastAlertTime = Date.now();
-        pushDynamicIncidentAlert(camId, personCount, densityLevelStr);
+        pushDynamicIncidentAlert(camId, personCount, densityLevelStr, alertStatus, sourceLabel);
+    }
+
+    if (sourceLabel) {
+        const metricEl = document.getElementById(camId === 'CAM-01' ? 'cam-detail-person-metric' : 'cam-optical-person-metric');
+        if (metricEl) metricEl.innerText = `● ${sourceLabel} • ANALYZED PERSONS: ${personCount} (${window.selectedModelId})`;
     }
 }
 
-function pushDynamicIncidentAlert(camId, count, level) {
+function triggerMediaUpload() {
+    const input = document.getElementById('media-upload-input');
+    if (input) input.click();
+}
+
+function syncMediaActionButtons() {
+    const badge = document.getElementById('detail-cam-id-badge');
+    const camFromPage = badge ? badge.innerText.trim() : '';
+    const camId = window.currentActiveCamId || camFromPage || 'CAM-02';
+    const analyzeBtn = document.getElementById('media-analyze-btn');
+    const uploadBtn = document.getElementById('media-upload-btn');
+    const bar = document.getElementById('media-upload-bar');
+    if (!analyzeBtn || !uploadBtn || !bar) return;
+
+    const isUploadCam = camId === 'CAM-02' || camId === 'CAM-03';
+    bar.style.display = isUploadCam ? 'flex' : 'none';
+    uploadBtn.style.display = 'inline-flex';
+    uploadBtn.innerText = camId === 'CAM-02' ? 'Upload Video' : (camId === 'CAM-03' ? 'Upload Image' : 'Upload Video');
+
+    const showAnalyze = isUploadCam;
+    analyzeBtn.style.display = showAnalyze ? 'inline-flex' : 'none';
+    analyzeBtn.innerText = camId === 'CAM-02' ? 'Analyze Video' : (camId === 'CAM-03' ? 'Analyze Image' : 'Analyze Now');
+}
+
+function setMediaUploadMode(camId) {
+    const bar = document.getElementById('media-upload-bar');
+    const btn = document.getElementById('media-upload-btn');
+    const input = document.getElementById('media-upload-input');
+    const analyzeBtn = document.getElementById('media-analyze-btn');
+    if (!bar || !btn || !input) return;
+
+    if (camId === 'CAM-02') {
+        bar.style.display = 'flex';
+        btn.style.display = 'inline-flex';
+        btn.innerText = 'Upload Video';
+        input.accept = 'video/*';
+        input.multiple = false;
+        if (analyzeBtn) analyzeBtn.innerText = 'Analyze Video';
+    } else if (camId === 'CAM-03') {
+        bar.style.display = 'flex';
+        btn.style.display = 'inline-flex';
+        btn.innerText = 'Upload Image';
+        input.accept = 'image/*';
+        input.multiple = false;
+        if (analyzeBtn) analyzeBtn.innerText = 'Analyze Image';
+    } else {
+        bar.style.display = 'none';
+        btn.style.display = 'none';
+        if (analyzeBtn) analyzeBtn.style.display = 'none';
+    }
+    syncMediaActionButtons();
+}
+
+async function handleUploadedMediaSelection(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+
+    const camId = window.currentActiveCamId || 'CAM-02';
+    if (camId === 'CAM-02') {
+        const video = document.createElement('video');
+        video.src = URL.createObjectURL(file);
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        video.onloadeddata = () => {
+            window.uploadedMediaState = { camId, file, type: 'video', videoEl: video, imgEl: null, frameB64: null };
+            renderUploadedMediaToCanvas();
+            syncMediaActionButtons();
+            video.play().catch(() => {});
+            if (!window.analysisRunning) {
+                startLivePersonAnalysisLoop();
+            }
+            setTimeout(() => analyzeUploadedMediaCycle(), 300);
+        };
+    } else if (camId === 'CAM-03') {
+        const image = new Image();
+        image.onload = async function() {
+            const reader = new FileReader();
+            reader.onload = async function() {
+                window.uploadedMediaState = { camId, file, type: 'image', imgEl: image, videoEl: null, frameB64: String(reader.result).split(',')[1] };
+                renderUploadedMediaToCanvas();
+                syncMediaActionButtons();
+                if (!window.analysisRunning) {
+                    startLivePersonAnalysisLoop();
+                }
+                await analyzeUploadedMediaCycle();
+            };
+            reader.readAsDataURL(file);
+        };
+        image.src = URL.createObjectURL(file);
+    }
+
+    event.target.value = '';
+}
+
+async function analyzeUploadedMediaCycle() {
+    const camId = window.currentActiveCamId || 'CAM-02';
+    const state = window.uploadedMediaState;
+    if (!state || state.camId !== camId) return;
+
+    try {
+        let frameB64 = null;
+        if (state.type === 'image') {
+            frameB64 = state.frameB64;
+            renderUploadedMediaToCanvas();
+        } else if (state.type === 'video' && state.videoEl) {
+            const video = state.videoEl;
+            if (video.readyState < 2 || !video.videoWidth) return;
+            renderUploadedMediaToCanvas();
+            frameB64 = await captureFrameBase64(video, 0.75);
+        }
+
+        if (!frameB64) return;
+        const result = await callYOLOEndpoint(frameB64, window.selectedModelId || 'yolo26n.pt');
+        if (!result || typeof result.count !== 'number') return;
+
+        window.analyzedPersonCentroids = result.centroids || [];
+        const sourceLabel = state.type === 'video' ? 'VIDEO ANALYSIS' : 'IMAGE ANALYSIS';
+        const personCount = result.count;
+        const warning = result.warning || 'NORMAL: safe human density';
+        const warningLevel = result.warning_level || 'ok';
+        const warningEl = document.getElementById('detail-chokepoint-val');
+        if (warningEl) {
+            warningEl.innerText = warning;
+            warningEl.style.color = warningLevel === 'danger' ? '#ef4444' : (warningLevel === 'warning' ? '#f59e0b' : '#22c55e');
+        }
+
+        window.yoloDetectionBoxes = result.boxes || [];
+        if (state.type === 'video') {
+            renderUploadedMediaToCanvas();
+            drawUploadedDetectionOverlay(window.yoloDetectionBoxes);
+        } else {
+            renderUploadedMediaToCanvas();
+            drawUploadedDetectionOverlay(window.yoloDetectionBoxes);
+        }
+
+        updateHeatmapAndAlertUI(personCount, sourceLabel);
+        if (state.type === 'video') {
+            setTimeout(() => { if (window.currentActiveCamId === camId && window.uploadedMediaState && window.uploadedMediaState.type === 'video') analyzeUploadedMediaCycle(); }, 700);
+        }
+    } catch (e) {
+        console.warn('[DensiTrack] uploaded media analysis failed:', e);
+    }
+}
+
+async function analyzeActiveFeedYOLO() {
+    const camId = window.currentActiveCamId || 'CAM-01';
+
+    if (window.uploadedMediaState && window.uploadedMediaState.camId === camId) {
+        await analyzeUploadedMediaCycle();
+        return;
+    }
+
+    let personCount = 0;
+    let centroids = [];
+
+    if (camId === 'CAM-01') {
+        const video = document.getElementById('cam-detail-video');
+        if (video && video.readyState >= 2 && video.videoWidth > 0) {
+            const frameB64 = await captureFrameBase64(video, 0.75);
+            if (frameB64) {
+                const result = await callYOLOEndpoint(frameB64, window.selectedModelId || 'yolo26n.pt');
+                if (result && typeof result.count === 'number') {
+                    personCount = result.count;
+                    centroids = result.centroids || [];
+                    window.yoloDetectionBoxes = result.boxes || [];
+                    drawDetectionOverlay(window.yoloDetectionBoxes);
+                    const warning = result.warning || 'NORMAL: safe human density';
+                    const warningLevel = result.warning_level || 'ok';
+                    const warningEl = document.getElementById('detail-chokepoint-val');
+                    if (warningEl) {
+                        warningEl.innerText = warning;
+                        warningEl.style.color = warningLevel === 'danger' ? '#ef4444' : (warningLevel === 'warning' ? '#f59e0b' : '#22c55e');
+                    }
+                }
+            }
+        }
+        const metricEl = document.getElementById('cam-detail-person-metric');
+        if (metricEl) metricEl.innerText = `● 1080p HD • ANALYZED PERSONS: ${personCount} (${window.selectedModelId})`;
+    } else {
+        const metricEl = document.getElementById('cam-optical-person-metric');
+        const state = window.uploadedMediaState;
+        if (state && state.camId === camId) {
+            if (state.type === 'image' || state.type === 'video') {
+                await analyzeUploadedMediaCycle();
+                return;
+            }
+        }
+        if (metricEl) metricEl.innerText = `● WAITING FOR LIVE ANALYSIS • ANALYZED PERSONS: 0 (${window.selectedModelId})`;
+    }
+
+    window.analyzedPersonCentroids = centroids;
+
+    // Update Crowd Density Stats & Badges
+    const countBadge = document.getElementById('detail-heatmap-count-badge');
+    if (countBadge) countBadge.innerText = `${personCount} Person${personCount === 1 ? '' : 's'} Detected`;
+
+    const densVal = document.getElementById('detail-density-val');
+    const chokepointVal = document.getElementById('detail-chokepoint-val');
+
+    let densityLevelStr = 'Optimal Flow';
+    let densityPctStr = `${Math.min(96, Math.max(4, personCount * 16))}%`;
+    let color = '#22c55e';
+
+    if (personCount >= 6) {
+        densityLevelStr = 'Critical Surge';
+        color = '#ef4444';
+    } else if (personCount >= 4) {
+        densityLevelStr = 'High Density';
+        color = '#f97316';
+    } else if (personCount >= 2) {
+        densityLevelStr = 'Elevated Flow';
+        color = '#f59e0b';
+    }
+
+    if (densVal) densVal.innerText = `${densityLevelStr.split(' ')[0]} (${densityPctStr})`;
+    if (chokepointVal) {
+        chokepointVal.innerText = densityLevelStr;
+        chokepointVal.style.color = color;
+    }
+
+    // Trigger incident alert if threshold is breached (debounced to 15s)
+    if (personCount >= 4 && (Date.now() - window.lastAlertTime > 15000)) {
+        window.lastAlertTime = Date.now();
+        pushDynamicIncidentAlert(camId, personCount, densityLevelStr, personCount >= 6 ? 'Critical' : 'Warning', 'LIVE ANALYSIS');
+    }
+    if (personCount === 0 && camId && document.getElementById('detail-alerts-list')) {
+        const pending = document.getElementById('detail-alerts-list').innerText.toLowerCase();
+        if (!pending.includes('waiting for live detection') && !pending.includes('person')) {
+            document.getElementById('detail-alerts-list').innerHTML = '<div style="padding: 14px; background: #16161c; border-radius: 8px; text-align: center; color: #a1a1aa; font-size: 12px;">Waiting for live detection data from the active feed.</div>';
+        }
+    }
+}
+
+function pushDynamicIncidentAlert(camId, count, level, severity = 'Critical', sourceLabel = 'LIVE ANALYSIS') {
     const alertsList = document.getElementById('detail-alerts-list');
     if (!alertsList) return;
 
@@ -1523,22 +1966,26 @@ function pushDynamicIncidentAlert(camId, count, level) {
     const timeStr = d.toTimeString().split(' ')[0];
     const roster = window.cctvPersonnelStore[camId] || [];
     const officer = roster.length > 0 ? roster[0].name : 'Duty Officer';
+    const severityColor = severity === 'Critical' ? '#f87171' : (severity === 'Warning' ? '#fbbf24' : '#4ade80');
+    const severityBg = severity === 'Critical' ? 'rgba(239, 68, 68, 0.2)' : (severity === 'Warning' ? 'rgba(245, 158, 11, 0.2)' : 'rgba(34, 197, 94, 0.2)');
+    const severityBorder = severity === 'Critical' ? '#ef4444' : (severity === 'Warning' ? '#f59e0b' : '#22c55e');
+    const actionText = severity === 'Critical' ? 'Critical' : (severity === 'Warning' ? 'Warning' : 'Info');
 
     const newAlertHtml = `
     <div style="background: #16161c; border-radius: 8px; padding: 10px; margin-bottom: 8px; animation: fadeIn 0.3s ease;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
             <div style="display: flex; align-items: center; gap: 6px;">
                 <span style="font-size: 10px; font-weight: 700; color: #a1a1aa; text-transform: uppercase;">Type:</span>
-                <span style="background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 700;">Critical</span>
+                <span style="background: ${severityBg}; color: ${severityColor}; border: 1px solid ${severityBorder}; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 700;">${actionText}</span>
             </div>
             <span style="font-size: 10px; font-family: monospace; color: #a1a1aa;">${timeStr}</span>
         </div>
         <div style="font-size: 11px; color: #ffffff; line-height: 1.4; margin-bottom: 6px;">
-            <b>Details:</b> Surge Detected: Model <b>${window.selectedModelId}</b> recorded <b>${count} persons</b> exceeding threshold.
+            <b>Details:</b> ${sourceLabel} reported <b>${count} persons</b> in the monitored area. Current status: <b>${level}</b>.
         </div>
         <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #1f1f26; padding-top: 6px;">
             <span style="font-size: 10px; color: #93c5fd;">Assigned: ${officer}</span>
-            <button onclick="sendAlertToPersonnel('${camId}', 'Critical', '${officer}')" style="background: #ef4444; color: #ffffff; border: none; padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer;">
+            <button onclick="sendAlertToPersonnel('${camId}', '${actionText}', '${officer}')" style="background: ${severity === 'Critical' ? '#ef4444' : (severity === 'Warning' ? '#f59e0b' : '#22c55e')}; color: #ffffff; border: none; padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer;">
                 Send Alert
             </button>
         </div>
@@ -1570,43 +2017,23 @@ function selectCameraPage(camId) {
         if (typeEl) typeEl.innerText = cam.type;
 
         const densVal = document.getElementById('detail-density-val');
-        if (densVal) densVal.innerText = cam.density;
+        if (densVal) densVal.innerText = 'Awaiting Analysis';
         const chokepointVal = document.getElementById('detail-chokepoint-val');
         if (chokepointVal) {
-            chokepointVal.innerText = cam.densityLevel;
-            chokepointVal.style.color = cam.densityColor;
+            chokepointVal.innerText = 'Standby';
+            chokepointVal.style.color = '#a1a1aa';
         }
+
+        const countBadge = document.getElementById('detail-heatmap-count-badge');
+        if (countBadge) countBadge.innerText = '0 Persons Detected';
 
         const alertsList = document.getElementById('detail-alerts-list');
+        if (alertsList) {
+            alertsList.innerHTML = '<div style="padding: 14px; background: #16161c; border-radius: 8px; text-align: center; color: #a1a1aa; font-size: 12px;">Waiting for live detection data from the active feed.</div>';
+        }
+
         const roster = window.cctvPersonnelStore[camId] || [];
         const officer = roster.length > 0 ? roster[0].name : 'Duty Officer';
-
-        if (alertsList && cam.alerts) {
-            if (cam.alerts.length === 0) {
-                alertsList.innerHTML = '<div style="padding: 14px; background: #16161c; border-radius: 8px; text-align: center; color: #a1a1aa; font-size: 12px;">No active security incidents flagged for ' + cam.id + '. Area status is nominal.</div>';
-            } else {
-                alertsList.innerHTML = cam.alerts.map(a => `
-                    <div style="background: #16161c; border-radius: 8px; padding: 10px; margin-bottom: 8px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                            <div style="display: flex; align-items: center; gap: 6px;">
-                                <span style="font-size: 10px; font-weight: 700; color: #a1a1aa; text-transform: uppercase;">Type:</span>
-                                <span style="background: ${a.sev === 'Critical' ? 'rgba(239, 68, 68, 0.18)' : 'rgba(245, 158, 11, 0.18)'}; color: ${a.sev === 'Critical' ? '#f87171' : '#fbbf24'}; border: 1px solid ${a.sev === 'Critical' ? '#ef4444' : '#f59e0b'}; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 700;">${a.sev}</span>
-                            </div>
-                            <span style="font-size: 10px; font-family: monospace; color: #a1a1aa;">${a.time}</span>
-                        </div>
-                        <div style="font-size: 11px; color: #ffffff; line-height: 1.4; margin-bottom: 6px;">
-                            <b>Details:</b> ${a.msg}
-                        </div>
-                        <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #1f1f26; padding-top: 6px;">
-                            <span style="font-size: 10px; color: #93c5fd;">Assigned: ${officer}</span>
-                            <button onclick="sendAlertToPersonnel('${cam.id}', '${a.sev}', '${officer}')" style="background: #ef4444; color: #ffffff; border: none; padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer;">
-                                Send Alert
-                            </button>
-                        </div>
-                    </div>
-                `).join('');
-            }
-        }
 
         renderPersonnelList();
 
@@ -1615,12 +2042,26 @@ function selectCameraPage(camId) {
         if (cam.id === 'CAM-01') {
             if (webcamBox) webcamBox.style.display = 'flex';
             if (opticalBox) opticalBox.style.display = 'none';
+            setMediaUploadMode('CAM-01');
             setTimeout(initCamDetailWebcam, 200);
         } else {
             if (webcamBox) webcamBox.style.display = 'none';
             if (opticalBox) opticalBox.style.display = 'flex';
-            startLivePersonAnalysisLoop();
-            setTimeout(runOpticalCanvasAnimation, 200);
+            setMediaUploadMode(cam.id);
+            const uploadInput = document.getElementById('media-upload-input');
+            if (uploadInput) uploadInput.onchange = handleUploadedMediaSelection;
+            if (!window.uploadedMediaState || window.uploadedMediaState.camId !== cam.id) {
+                window.uploadedMediaState = null;
+                window.analyzedPersonCentroids = [];
+                window.yoloDetectionBoxes = [];
+                const metricEl = document.getElementById('cam-optical-person-metric');
+                if (metricEl) metricEl.innerText = `● WAITING FOR LIVE ANALYSIS • ANALYZED PERSONS: 0 (${window.selectedModelId})`;
+                updateHeatmapAndAlertUI(0, 'READY FOR ANALYSIS');
+                startLivePersonAnalysisLoop();
+                setTimeout(runOpticalCanvasAnimation, 200);
+            } else {
+                renderUploadedMediaToCanvas();
+            }
         }
     }
 
@@ -1657,10 +2098,14 @@ function handleGlowNav(target) {
 
 // Auto-trigger webcam once loaded
 window.addEventListener('DOMContentLoaded', () => { 
+    const uploadInput = document.getElementById('media-upload-input');
+    if (uploadInput) uploadInput.onchange = handleUploadedMediaSelection;
     setTimeout(initCam01Webcam, 600); 
     renderPersonnelList();
 });
 window.addEventListener('load', () => { 
+    const uploadInput = document.getElementById('media-upload-input');
+    if (uploadInput) uploadInput.onchange = handleUploadedMediaSelection;
     setTimeout(initCam01Webcam, 600); 
     renderPersonnelList();
 });
@@ -1724,54 +2169,51 @@ function runHeatmapAnimation() {
     animate();
 }
 
-// Simulated Optical Surveillance Feed
+// Live optical canvas updates from actual detection boxes only.
 function runOpticalCanvasAnimation() {
+    if (window.uploadedMediaState && ['CAM-02', 'CAM-03'].includes(window.currentActiveCamId || 'CAM-02')) {
+        renderUploadedMediaToCanvas();
+        return;
+    }
+
     const canvas = document.getElementById('cctv-optical-stream-canvas');
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    let boxes = [
-        { x: 100, y: 110, w: 52, h: 104, vx: 0.8, id: 'ID:102' },
-        { x: 260, y: 130, w: 48, h: 96, vx: -0.6, id: 'ID:105' },
-        { x: 420, y: 80, w: 56, h: 112, vx: 0.7, id: 'ID:109' },
-        { x: 330, y: 170, w: 50, h: 100, vx: -0.9, id: 'ID:114' },
-    ];
-
     function animateOptical() {
+        if (window.uploadedMediaState && ['CAM-02', 'CAM-03'].includes(window.currentActiveCamId || 'CAM-02')) {
+            renderUploadedMediaToCanvas();
+            return;
+        }
         if (!document.getElementById('cctv-optical-stream-canvas')) return;
         ctx.fillStyle = '#050508';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        // Subtle CCTV scanning line
-        const scanY = (Date.now() / 15) % canvas.height;
+        const scanY = (Date.now() / 18) % canvas.height;
         ctx.strokeStyle = 'rgba(0, 114, 245, 0.15)';
         ctx.lineWidth = 2;
         ctx.beginPath(); ctx.moveTo(0, scanY); ctx.lineTo(canvas.width, scanY); ctx.stroke();
 
-        // Draw bounding boxes with model tag
-        boxes.forEach(b => {
-            b.x += b.vx;
-            if (b.x < 30 || b.x > canvas.width - 90) b.vx *= -1;
+        const boxes = window.yoloDetectionBoxes || [];
+        if (Array.isArray(boxes) && boxes.length > 0) {
+            boxes.forEach((b, idx) => {
+                const x1 = Number(b.x1 || 0) * canvas.width;
+                const y1 = Number(b.y1 || 0) * canvas.height;
+                const bw = (Number(b.x2 || 0) - Number(b.x1 || 0)) * canvas.width;
+                const bh = (Number(b.y2 || 0) - Number(b.y1 || 0)) * canvas.height;
+                ctx.strokeStyle = '#22c55e';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(x1, y1, bw, bh);
+                ctx.fillStyle = '#4ade80';
+                ctx.font = '9px monospace';
+                ctx.fillText(`Person ${idx + 1}`, x1 + 4, Math.max(12, y1 - 8));
+            });
+        }
 
-            ctx.strokeStyle = '#22c55e';
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(b.x, b.y, b.w, b.h);
-
-            ctx.fillStyle = '#22c55e';
-            ctx.fillRect(b.x - 2, b.y - 2, 6, 2);
-            ctx.fillRect(b.x - 2, b.y - 2, 2, 6);
-
-            ctx.fillStyle = 'rgba(0,0,0,0.75)';
-            ctx.fillRect(b.x, b.y - 15, 68, 14);
-            ctx.fillStyle = '#22c55e';
-            ctx.font = '9px monospace';
-            ctx.fillText(b.id + ' 0.94', b.x + 2, b.y - 4);
-        });
-
-        requestAnimationFrame(animateOptical);
+        window.opticalAnimationFrame = requestAnimationFrame(animateOptical);
     }
-    animateOptical();
+    window.opticalAnimationFrame = requestAnimationFrame(animateOptical);
 }
 </script>
 """
@@ -2137,6 +2579,31 @@ with gr.Blocks(title="DensiTrack — Real-Time CCTV Command Studio") as demo:
         outputs=[alert_store, alerts_table, dispatch_status_box],
     )
 
+    demo.load(
+        fn=None,
+        js="() => { console.log('[DensiTrack] App ready. YOLO endpoint at /yolo_predict'); }"
+    )
+
+
+# -------------------------------------------------------
+# Mount a custom FastAPI route /yolo_predict on the Gradio server
+# so the browser JS can POST base64 frames and get YOLO results
+# -------------------------------------------------------
+from fastapi import Request as _Request
+from fastapi.responses import JSONResponse as _JSONResponse
+
+@demo.app.post("/yolo_predict")
+async def yolo_predict_route(request: _Request):
+    try:
+        body = await request.json()
+        frame_b64 = body.get("frame_b64", "")
+        model_id = body.get("model_id", "yolo26n.pt")
+        result_json = predict_frame_base64(frame_b64, model_id)
+        import json as _json
+        return _JSONResponse(content=_json.loads(result_json))
+    except Exception as e:
+        return _JSONResponse(content={"count": 0, "centroids": [], "boxes": [], "error": str(e)})
+
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, css=VISUVATE_CSS, head=HEAD_JS)
+    demo.launch(server_name="127.0.0.1", server_port=resolve_gradio_port(), css=VISUVATE_CSS, head=HEAD_JS)

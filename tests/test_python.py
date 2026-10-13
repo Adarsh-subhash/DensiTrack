@@ -14,6 +14,7 @@ import yaml
 from PIL import Image
 
 from tests import CFG, MODEL, SOURCE, SOURCES_LIST, TMP
+from app import resolve_model_path
 from ultralytics import RTDETR, YOLO
 from ultralytics.cfg import MODELS, TASK2DATA, TASKS
 from ultralytics.data.build import load_inference_source
@@ -34,6 +35,12 @@ from ultralytics.utils.downloads import download
 from ultralytics.utils.torch_utils import TORCH_1_9
 
 IS_TMP_WRITEABLE = is_dir_writeable(TMP)  # WARNING: must be run once tests start as TMP does not exist on tests/init
+
+
+def test_resolve_model_path_yolo26n_fallback():
+    """YOLO26n should be accepted as a requested model but resolve to a supported Nano checkpoint in this environment."""
+    assert resolve_model_path("yolo26n.pt") == "yolo11n.pt"
+    assert resolve_model_path("yolo11n.pt") == "yolo11n.pt"
 
 
 def test_model_forward():
